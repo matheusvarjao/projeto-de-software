@@ -308,4 +308,322 @@
     let socket = null;
     let currentMatchId = null;
 
-    function setRoot(
+    function setRoot(html) {
+      document.getElementById('root').innerHTML = html;
+    }
+
+    async function api(path, opts = {}) {
+      opts.headers = opts.headers || {};
+      opts.headers['Content-Type'] = 'application/json';
+      if (token) opts.headers['Authorization'] = 'Bearer ' + token;
+      
+      try {
+        const res = await fetch(API + path, opts);
+        const data = await res.json().catch(() => null);
+        if (!res.ok) throw data || { error: 'Erro na requisição' };
+        return data;
+      } catch (error) {
+        console.error(error);
+        throw error;
+      }
+    }
+
+    function connectSocket() {
+      if (!token || !me) return;
+      socket = io('', { auth: { token }, reconnection: true });
+      
+      socket.on('connect', () => console.log('✓ Conectado'));
+      socket.on('matched', (data) => {
+        showNotification('🎉 Novo Match!');
+        setTimeout(renderApp, 1500);
+      });
+      socket.on('message', (data) => {
+        if (currentMatchId === data.matchId) {
+          loadMessages(currentMatchId);
+        }
+      });
+      socket.on('disconnect', () => console.log('✗ Desconectado'));
+    }
+
+    function showNotification(msg) {
+      alert(msg);
+    }
+
+    async function loadMe() {
+      try {
+        me = await api('/users/me');
+        connectSocket();
+      } catch (e) {
+        me = null;
+      }
+    }
+
+    function renderLogin() {
+      setRoot(`
+        <div class="card">
+          <h4>Bem-vindo ao TINTIN</h4>
+          <p class="small">Conecte-se e comece a aprender!</p>
+          <input id="email" placeholder="Email" type="email" />
+          <input id="password" placeholder="Senha" type="password" />
+          <button onclick="login()">🔓 Entrar</button>
+          <button class="btn-secondary" onclick="register()">📝 Criar Conta</button>
+          <p class="small" style="margin-top: 16px; text-align: center;">
+            <strong>Demo:</strong> ana@example.com / password
+          </p>
+        </div>
+      `);
+    }
+
+    async function login() {
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      
+      if (!email || !password) {
+        alert('Preencha todos os campos');
+        return;
+      }
+      
+      try {
+        const res = await api('/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ email, password })
+        });
+        token = res.token;
+        localStorage.setItem('tintin_token', token);
+        await loadMe();
+        renderApp();
+      } catch (e) {
+        alert('❌ Erro ao entrar: ' + (e.error || 'Verifique seus dados'));
+      }
+    }
+
+    async function register() {
+      const email = document.getElementById('email').value || 'user' + Math.floor(Math.random() * 1000) + '@example.com';
+      const password = document.getElementById('password').value || 'password123';
+      const name = email.split('@')[0];
+      
+      try {
+        const res = await api('/auth/register', {
+          method: 'POST',
+          body: JSON.stringify({ name, email, password })
+        });
+        token = res.token;
+        localStorage.setItem('tintin_token', token);
+        await loadMe();
+        renderApp();
+      } catch (e) {
+        alert('❌ Erro ao registrar: ' + (e.error || 'Tente novamente'));
+      }
+    }
+
+    let cards = [];
+
+    async function loadCards() {
+      try {
+        cards = await api('/swipe/cards');
+      } catch (e) {
+        cards = [];
+      }
+    }
+
+    async function doSwipe(targetId, action) {
+      try {
+        const res = await api('/swipe/action', {
+          method: 'POST',
+          body: JSON.stringify({ targetUserId: targetId, action })
+        });
+        if (res.match) {
+          showNotification('🎉 MATCH! Vocês combinam!');
+        }
+        await loadCards();
+        renderSwipe();
+      } catch (e) {
+        alert('Erro ao fazer swipe');
+      }
+    }
+
+    async function renderSwipe() {
+      if (cards.length === 0) {
+        setRoot(`
+          <div class="card">
+            <h4>😴 Sem cards disponíveis</h4>
+            <p class="small">Volte mais tarde para mais pessoas!</p>
+            <button class="btn-secondary" onclick="renderApp()">← Voltar</button>
+          </div>
+        `);
+        return;
+      }
+
+      const c = cards[0];
+      const skillsHtml = (c.skills || []).map(s => `<span class="chip">${s.skill} (${s.mode})</span>`).join('');
+      const ratingHtml = c.ratingAvg ? `<span class="badge">⭐ ${c.ratingAvg}</span>` : '';
+
+      setRoot(`
+        <div class="card">
+          <h4>${c.name}${ratingHtml}</h4>
+          <p class="small">${c.bio || 'Sem descrição'}</p>
+          <div style="margin: 12px 0;">${skillsHtml}</div>
+          <div class="row">
+            <button class="btn-secondary" onclick="skipCard()">👎 Passar</button>
+            <button onclick="likeCard()">❤️ Curtir</button>
+          </div>
+        </div>
+        <button class="btn-secondary" onclick="renderApp()">← Menu</button>
+      `);
+      
+      window.likeCard = () => doSwipe(c.id, 'like');
+      window.skipCard = () => { cards = cards.filter(x => x.id !== c.id); renderSwipe(); };
+    }
+
+    async function renderMatches() {
+      try {
+        const ms = await api('/matches');
+        
+        const matchesHtml = ms.map(m => `
+          <div class="match-card">
+            <div><strong>${m.other}</strong></div>
+            <button class="btn-secondary" onclick="openChat('${m.id}')">💬</button>
+          </div>
+        `).join('');
+
+        setRoot(`
+          <div class="card">
+            <h4>💜 Meus Matches</h4>
+            ${matchesHtml || '<p class="small">Nenhum match ainda :(</p>'}
+            <button class="btn-secondary" style="margin-top: 12px;" onclick="renderApp()">← Voltar</button>
+          </div>
+        `);
+
+        window.openChat = (matchId) => {
+          currentMatchId = matchId;
+          renderChat(matchId);
+        };
+      } catch (e) {
+        alert('Erro ao carregar matches');
+      }
+    }
+
+    async function loadMessages(matchId) {
+      try {
+        const msgs = await api('/matches/' + matchId + '/messages');
+        const msgHtml = msgs.map(m => `
+          <div class="message ${m.senderId === me.id ? 'own' : ''}">
+            <b>${m.senderId === me.id ? 'Você' : 'Outro'}:</b> ${m.content}
+          </div>
+        `).join('');
+        
+        const container = document.getElementById('msgs');
+        if (container) {
+          container.innerHTML = msgHtml;
+          container.scrollTop = container.scrollHeight;
+        }
+      } catch (e) {
+        console.error('Erro ao carregar mensagens', e);
+      }
+    }
+
+    function sendMessage(matchId, text) {
+      if (!socket || !text) return;
+      socket.emit('send_message', { matchId, content: text });
+      document.getElementById('msgtext').value = '';
+      setTimeout(() => loadMessages(matchId), 100);
+    }
+
+    async function renderChat(matchId) {
+      setRoot(`
+        <div class="card">
+          <h4>💬 Chat</h4>
+          <div id="msgs" class="messages"></div>
+          <input id="msgtext" placeholder="Digite uma mensagem..." />
+          <div class="row">
+            <button onclick="sendMsg()">Enviar</button>
+            <button class="btn-secondary" onclick="renderMatches()">Voltar</button>
+          </div>
+        </div>
+      `);
+
+      window.sendMsg = () => {
+        const text = document.getElementById('msgtext').value;
+        sendMessage(matchId, text);
+      };
+
+      await loadMessages(matchId);
+    }
+
+    async function renderProfile() {
+      setRoot(`
+        <div class="card">
+          <h4>👤 Meu Perfil</h4>
+          <input id="name" value="${me.name || ''}" placeholder="Nome" />
+          <textarea id="bio" placeholder="Sobre você" style="min-height: 80px;">${me.bio || ''}</textarea>
+          <small class="small">Habilidades (formato: skill:teach, skill:learn)</small>
+          <input id="skills" placeholder="Ex: Python:teach, Inglês:learn" />
+          <button onclick="saveProfile()">💾 Salvar</button>
+          <button class="btn-secondary" onclick="renderApp()">Voltar</button>
+        </div>
+      `);
+
+      window.saveProfile = async () => {
+        const name = document.getElementById('name').value;
+        const bio = document.getElementById('bio').value;
+        const skillsRaw = document.getElementById('skills').value;
+        const skills = skillsRaw ? skillsRaw.split(',').map(s => {
+          const [skill, mode] = s.split(':');
+          return { skill: skill?.trim(), mode: mode?.trim() || 'learn' };
+        }) : [];
+
+        try {
+          await api('/users/me', {
+            method: 'PUT',
+            body: JSON.stringify({ name, bio, skills })
+          });
+          await loadMe();
+          alert('✓ Perfil atualizado!');
+          renderApp();
+        } catch (e) {
+          alert('Erro ao salvar');
+        }
+      };
+    }
+
+    function logout() {
+      localStorage.removeItem('tintin_token');
+      token = null;
+      me = null;
+      if (socket) socket.disconnect();
+      renderLogin();
+    }
+
+    async function renderApp() {
+      if (!token) {
+        renderLogin();
+        return;
+      }
+
+      await loadMe();
+      await loadCards();
+
+      setRoot(`
+        <div class="card">
+          <h4>👋 Olá, ${me.name}</h4>
+          <p class="small">${me.bio || 'Configure seu perfil!'}</p>
+          <div class="row">
+            <button onclick="renderSwipe()">🔥 Swipe</button>
+            <button class="btn-secondary" onclick="renderMatches()">💜 Matches</button>
+          </div>
+          <div class="row">
+            <button class="btn-secondary" onclick="renderProfile()">👤 Perfil</button>
+            <button class="btn-secondary" onclick="logout()">🚪 Sair</button>
+          </div>
+        </div>
+      `);
+    }
+
+    // Init
+    (async () => {
+      if (token) await loadMe();
+      renderApp();
+    })();
+  </script>
+</body>
+</html>
