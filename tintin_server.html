@@ -1,0 +1,429 @@
+/*
+Single-file demo full-stack app: TINTIN (minimal)
+Run: 
+  1) npm init -y
+  2) npm install express socket.io cors bcryptjs jsonwebtoken
+  3) node tintin_fullstack_demo_server.js
+Open http://localhost:3000
+
+This is a simplified demo intended for local development only. Data persisted in memory.
+*/
+
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { Server } = require('socket.io');
+
+const SECRET = 'dev_secret_change_me';
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+app.use(cors());
+app.use(express.json());
+
+// In-memory stores (demo)
+const users = []; // {id, name, email, passwordHash, avatarUrl, skills, bio, ratingSum, ratingCount}
+const likes = []; // {from, to}
+const matches = []; // {id,userA,userB,createdAt}
+const messages = {}; // matchId -> [{id, senderId, content, createdAt}]
+
+let nextId = 1;
+function genId(prefix='id') { return `${prefix}_${nextId++}` }
+
+// Helper auth
+function generateToken(user) {
+  return jwt.sign({id: user.id, email: user.email}, SECRET, {expiresIn:'7d'});
+}
+function authMiddleware(req,res,next){
+  const auth = req.headers.authorization;
+  if(!auth) return res.status(401).json({error:'missing'});
+  const token = auth.replace('Bearer ','');
+  try{
+    const data = jwt.verify(token, SECRET);
+    req.userId = data.id;
+    next();
+  }catch(e){
+    return res.status(401).json({error:'invalid token'});
+  }
+}
+
+// Seed demo users
+function seed(){
+  const demo = [
+    {name:'Ana Silva', email:'ana@example.com', skills:[{skill:'Inglês',mode:'teach'},{skill:'Python',mode:'learn'}], bio:'Gosta de ensinar conversação.'},
+    {name:'Bruno Costa', email:'bruno@example.com', skills:[{skill:'JavaScript',mode:'teach'},{skill:'Espanhol',mode:'learn'}], bio:'Dev fullstack que quer praticar espanhol.'},
+    {name:'Carla Gomes', email:'carla@example.com', skills:[{skill:'Matemática',mode:'teach'},{skill:'Guitarra',mode:'learn'}], bio:'Professora de matemática.'},
+    {name:'Diego Melo', email:'diego@example.com', skills:[{skill:'Design',mode:'teach'},{skill:'Inglês',mode:'learn'}], bio:'Designer UX.'},
+    {name:'Eva Luz', email:'eva@example.com', skills:[{skill:'Português',mode:'teach'},{skill:'Python',mode:'learn'}], bio:'Jornalista e entusiasta de dados.'}
+  ];
+  demo.forEach((d,i)=>{
+    const id = genId('u');
+    users.push({id, name:d.name, email:d.email, passwordHash: bcrypt.hashSync('password',8), avatarUrl:'', skills:d.skills, bio:d.bio, ratingSum:0, ratingCount:0, createdAt: new Date().toISOString()});
+  });
+}
+seed();
+
+// Routes
+app.post('/api/auth/register', (req,res)=>{
+  const {name,email,password} = req.body;
+  if(!name||!email||!password) return res.status(400).json({error:'missing fields'});
+  if(users.find(u=>u.email===email)) return res.status(400).json({error:'email exists'});
+  const id = genId('u');
+  const passwordHash = bcrypt.hashSync(password,8);
+  const user = {id,name,email,passwordHash,avatarUrl:'',skills:[],bio:'',ratingSum:0,ratingCount:0,createdAt:new Date().toISOString()};
+  users.push(user);
+  const token = generateToken(user);
+  res.json({token,user:{id,name,email,avatarUrl:user.avatarUrl,skills:user.skills,bio:user.bio}});
+});
+
+app.post('/api/auth/login', (req,res)=>{
+  const {email,password} = req.body;
+  const user = users.find(u=>u.email===email);
+  if(!user) return res.status(400).json({error:'invalid credentials'});
+  if(!bcrypt.compareSync(password, user.passwordHash)) return res.status(400).json({error:'invalid credentials'});
+  const token = generateToken(user);
+  res.json({token,user:{id:user.id,name:user.name,email:user.email,avatarUrl:user.avatarUrl,skills:user.skills,bio:user.bio}});
+});
+
+app.get('/api/users/me', authMiddleware, (req,res)=>{
+  const user = users.find(u=>u.id===req.userId);
+  if(!user) return res.status(404).json({error:'not found'});
+  const ratingAvg = user.ratingCount? (user.ratingSum/user.ratingCount):null;
+  res.json({id:user.id,name:user.name,email:user.email,avatarUrl:user.avatarUrl,skills:user.skills,bio:user.bio,ratingAvg});
+});
+
+app.put('/api/users/me', authMiddleware, (req,res)=>{
+  const user = users.find(u=>u.id===req.userId);
+  if(!user) return res.status(404).json({error:'not found'});
+  const {name,avatarUrl,skills,bio} = req.body;
+  if(name) user.name = name;
+  if(avatarUrl) user.avatarUrl = avatarUrl;
+  if(skills) user.skills = skills;
+  if(bio) user.bio = bio;
+  res.json({ok:true});
+});
+
+// Get swipe cards (exclude self, exclude already liked by requester?)
+app.get('/api/swipe/cards', authMiddleware, (req,res)=>{
+  // simple: return users except self and those already passed/liked
+  const seen = new Set(likes.filter(l=>l.from===req.userId).map(l=>l.to));
+  const cards = users.filter(u=>u.id!==req.userId && !seen.has(u.id)).map(u=>({id:u.id,name:u.name,avatarUrl:u.avatarUrl,skills:u.skills,bio:u.bio}));
+  res.json(cards);
+});
+
+app.post('/api/swipe/action', authMiddleware, (req,res)=>{
+  const {targetUserId,action} = req.body;
+  if(!targetUserId||!action) return res.status(400).json({error:'missing'});
+  likes.push({from:req.userId,to:targetUserId,action,createdAt:new Date().toISOString()});
+  // check for reciprocal like
+  if(action==='like'){
+    const reciprocal = likes.find(l=>l.from===targetUserId && l.to===req.userId && l.action==='like');
+    if(reciprocal){
+      const matchId = genId('m');
+      matches.push({id:matchId,userA:req.userId,userB:targetUserId,createdAt:new Date().toISOString()});
+      messages[matchId] = [];
+      // notify sockets if connected
+      io.to(req.userId).emit('matched',{matchId,with:targetUserId});
+      io.to(targetUserId).emit('matched',{matchId,with:req.userId});
+      return res.json({ok:true,match:true,matchId});
+    }
+  }
+  res.json({ok:true,match:false});
+});
+
+app.get('/api/matches', authMiddleware, (req,res)=>{
+  const myMatches = matches.filter(m=>m.userA===req.userId||m.userB===req.userId).map(m=>({id:m.id,other: m.userA===req.userId?m.userB:m.userA,createdAt:m.createdAt}));
+  res.json(myMatches);
+});
+
+app.get('/api/matches/:id/messages', authMiddleware, (req,res)=>{
+  const m = matches.find(x=>x.id===req.params.id && (x.userA===req.userId||x.userB===req.userId));
+  if(!m) return res.status(404).json({error:'not found'});
+  res.json(messages[req.params.id]||[]);
+});
+
+app.post('/api/ratings', authMiddleware, (req,res)=>{
+  const {toUserId,stars,comment} = req.body;
+  const target = users.find(u=>u.id===toUserId);
+  if(!target) return res.status(404).json({error:'user not found'});
+  target.ratingSum += Number(stars||0);
+  target.ratingCount += 1;
+  res.json({ok:true,avg: target.ratingSum/target.ratingCount});
+});
+
+// Serve static index (embedded client)
+app.get('/', (req,res)=>{
+  res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TINTIN Demo</title>
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif; margin:0; padding:0; display:flex; align-items:center; justify-content:center; min-height:100vh; background:#f5f7fb}
+    .app{width:100%;max-width:420px;background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,0.08);overflow:hidden}
+    header{padding:12px 16px;background:linear-gradient(90deg,#6B5BFF,#5BC0EB);color:white}
+    .container{padding:16px}
+    input,button,textarea{width:100%;padding:8px;margin:6px 0;border-radius:8px;border:1px solid #ddd}
+    .card{border-radius:10px;padding:12px;border:1px solid #eee;margin-bottom:12px}
+    .row{display:flex;gap:8px}
+    .btn{padding:10px;border-radius:8px;border:none;background:#6B5BFF;color:white}
+    .btn.secondary{background:#eee;color:#333}
+    .small{font-size:12px;color:#666}
+    .chip{display:inline-block;padding:6px 8px;border-radius:20px;border:1px solid #ddd;margin:4px}
+    .matches-list li{margin-bottom:8px}
+    .messages{height:200px;overflow:auto;border:1px solid #eee;padding:8px;border-radius:8px;background:#fafafa}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h3>TINTIN — demo</h3>
+    </header>
+    <div class="container" id="root">Loading...</div>
+  </div>
+
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+// Minimal client using fetch + basic DOM (no React to keep single-file simple)
+const API = '/api';
+let token = localStorage.getItem('tintin_token');
+let me = null;
+let socket = null;
+
+function setRoot(html){document.getElementById('root').innerHTML = html}
+
+async function api(path, opts={}){
+  opts.headers = opts.headers||{};
+  opts.headers['Content-Type']='application/json';
+  if(token) opts.headers['Authorization']='Bearer '+token;
+  const res = await fetch(API+path, opts);
+  const j = await res.json().catch(()=>null);
+  if(!res.ok) throw j||{error:'network'};
+  return j;
+}
+
+function connectSocket(){
+  if(!token||!me) return;
+  socket = io('',{auth:{token}});
+  socket.on('connect',()=>console.log('socket connected'));
+  socket.on('matched', data=>{
+    alert('Novo match!');
+    renderApp();
+  });
+  socket.on('message', data=>{
+    // simple: notify
+    console.log('msg',data);
+    if(currentMatchId===data.matchId){
+      loadMessages(currentMatchId);
+    }else{
+      // ignore
+    }
+  });
+}
+
+async function loadMe(){
+  try{
+    me = await api('/users/me');
+    connectSocket();
+  }catch(e){ me=null }
+}
+
+function renderLogin(){
+  setRoot(`
+    <div>
+      <div class="card">
+        <h4>Entrar / Registrar</h4>
+        <input id="email" placeholder="email" />
+        <input id="password" placeholder="senha" type="password" />
+        <div class="row">
+          <button class="btn" onclick="login()">Entrar</button>
+          <button class="btn secondary" onclick="register()">Registrar (senha: password)</button>
+        </div>
+      </div>
+    </div>
+  `);
+}
+
+async function login(){
+  const email = document.getElementById('email').value;
+  const password = document.getElementById('password').value;
+  try{
+    const res = await fetch(API+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+    const j = await res.json();
+    if(!res.ok) return alert(JSON.stringify(j));
+    token = j.token; localStorage.setItem('tintin_token', token);
+    await loadMe();
+    renderApp();
+  }catch(e){ alert('erro'); }
+}
+async function register(){
+  const email = document.getElementById('email').value || ('user'+Math.floor(Math.random()*1000)+'@example.com');
+  const password = document.getElementById('password').value || 'password';
+  const name = email.split('@')[0];
+  const res = await fetch(API+'/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,email,password})});
+  const j = await res.json();
+  if(!res.ok) return alert(JSON.stringify(j));
+  token = j.token; localStorage.setItem('tintin_token', token);
+  await loadMe();
+  renderApp();
+}
+
+let cardsCache = [];
+async function loadCards(){
+  cardsCache = await api('/swipe/cards');
+}
+
+let currentMatchId = null;
+
+async function doSwipe(targetId, action){
+  const res = await api('/swipe/action',{method:'POST',body:JSON.stringify({targetUserId:targetId,action})});
+  if(res.match){
+    alert('Match criado!');
+  }
+  await loadCards();
+  renderSwipe();
+}
+
+async function renderSwipe(){
+  if(cardsCache.length===0){
+    setRoot('<div class="card"><h4>Nenhum card disponível</h4><button class="btn" onclick="renderApp()">Voltar</button></div>');
+    return;
+  }
+  const c = cardsCache[0];
+  setRoot(`
+    <div>
+      <div class="card">
+        <h4>${c.name}</h4>
+        <p class="small">${c.bio||''}</p>
+        <div>${(c.skills||[]).map(s=>`<span class="chip">${s.skill} (${s.mode})</span>`).join('')}</div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn secondary" onclick="skip()">Passar</button>
+          <button class="btn" onclick="like()">Curtir</button>
+        </div>
+      </div>
+      <div><button class="btn secondary" onclick="renderApp()">Menu</button></div>
+    </div>
+  `);
+  window.like = async ()=>{ await doSwipe(c.id,'like') };
+  window.skip = async ()=>{ likesLocalPush(c.id); await doSwipe(c.id,'pass') };
+}
+
+function likesLocalPush(id){ cardsCache = cardsCache.filter(x=>x.id!==id) }
+
+async function renderMatches(){
+  const ms = await api('/matches');
+  setRoot(`<div><h4>Matches</h4><ul class="matches-list">${ms.map(m=>`<li>${m.other} <button onclick="openChat('${m.id}','${m.other}')">Chat</button></li>`).join('')}</ul><div style="margin-top:10px"><button class="btn secondary" onclick="renderApp()">Voltar</button></div></div>`);
+  window.openChat = async (matchId,otherId)=>{ currentMatchId = matchId; renderChat(matchId); }
+}
+
+async function loadMessages(matchId){
+  if(!matchId) return;
+  const msgs = await api('/matches/'+matchId+'/messages');
+  const html = msgs.map(m=>`<div><b>${m.senderId===me.id?'Você':m.senderId}</b>: ${m.content}</div>`).join('');
+  document.getElementById('msgs').innerHTML = html;
+}
+
+async function sendMessage(matchId, text){
+  // via socket
+  socket.emit('send_message',{matchId,content:text});
+  await loadMessages(matchId);
+}
+
+async function renderChat(matchId){
+  const html = `
+    <div class="card">
+      <h4>Chat</h4>
+      <div id="msgs" class="messages"></div>
+      <input id="msgtext" placeholder="Mensagem..." />
+      <div class="row"><button class="btn" onclick="sendMsg()">Enviar</button> <button class="btn secondary" onclick="renderMatches()">Voltar</button></div>
+    </div>
+  `;
+  setRoot(html);
+  window.sendMsg = async ()=>{ const t = document.getElementById('msgtext').value; if(!t) return; await sendMessage(matchId,t); document.getElementById('msgtext').value=''; }
+  await loadMessages(matchId);
+}
+
+async function renderProfile(){
+  setRoot(`<div class="card"><h4>Meu perfil</h4>
+    <input id="name" value="${me.name||''}" placeholder="nome" />
+    <textarea id="bio" placeholder="bio">${me.bio||''}</textarea>
+    <input id="skills" placeholder="skills (format: skill:mode, comma)" />
+    <div class="row"><button class="btn" onclick="saveProfile()">Salvar</button><button class="btn secondary" onclick="renderApp()">Voltar</button></div>
+  </div>`);
+  window.saveProfile = async ()=>{
+    const name = document.getElementById('name').value;
+    const bio = document.getElementById('bio').value;
+    const skillsRaw = document.getElementById('skills').value;
+    const skills = skillsRaw? skillsRaw.split(',').map(s=>{ const [skill,mode]=s.trim().split(':'); return {skill:skill?skill.trim():'', mode:mode?mode.trim():'learn'} }): [];
+    await api('/users/me',{method:'PUT',body:JSON.stringify({name,bio,skills})});
+    await loadMe();
+    alert('salvo');
+    renderApp();
+  }
+}
+
+async function logout(){ localStorage.removeItem('tintin_token'); token=null; me=null; if(socket) socket.disconnect(); renderLogin(); }
+
+async function renderApp(){
+  if(!token){ renderLogin(); return; }
+  await loadMe();
+  await loadCards();
+  setRoot(`<div>
+    <div class="card">
+      <h4>Olá, ${me.name}</h4>
+      <div class="small">${me.bio||''}</div>
+      <div style="margin-top:8px" class="row">
+        <button class="btn" onclick="renderSwipe()">Swipe</button>
+        <button class="btn secondary" onclick="renderMatches()">Matches</button>
+        <button class="btn secondary" onclick="renderProfile()">Perfil</button>
+        <button class="btn secondary" onclick="logout()">Sair</button>
+      </div>
+    </div>
+  </div>`);
+}
+
+// init
+(async ()=>{
+  if(token) await loadMe();
+  renderApp();
+})();
+</script>
+</body>
+</html>`);
+});
+
+// Socket auth middleware
+io.use((socket,next)=>{
+  const token = socket.handshake.auth && socket.handshake.auth.token;
+  if(!token) return next(new Error('auth error'));
+  try{
+    const data = jwt.verify(token, SECRET);
+    socket.userId = data.id;
+    return next();
+  }catch(e){ return next(new Error('auth error')); }
+});
+
+io.on('connection',(socket)=>{
+  // join room for user to receive notifications
+  socket.join(socket.userId);
+  socket.on('send_message',(payload)=>{
+    const {matchId, content} = payload;
+    const m = matches.find(x=>x.id===matchId);
+    if(!m) return;
+    if(m.userA!==socket.userId && m.userB!==socket.userId) return;
+    const msg = {id:genId('msg'), matchId, senderId:socket.userId, content, createdAt:new Date().toISOString()};
+    messages[matchId].push(msg);
+    // emit to both users
+    io.to(m.userA).emit('message',msg);
+    io.to(m.userB).emit('message',msg);
+  });
+  socket.on('disconnect',()=>{});
+});
+
+const PORT = 3000;
+server.listen(PORT, ()=>console.log('Server running on http://localhost:'+PORT));
